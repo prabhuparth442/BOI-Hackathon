@@ -62,31 +62,6 @@ def predict_score(features: np.ndarray, _raw_data: dict = None) -> float:
         risk_score = float(proba[0] @ SEVERITY_VEC)
         risk_score = round(min(max(risk_score, 0.0), 100.0), 1)
 
-        # ── Safety cap: mirror the heuristic's false-positive guard ──────────
-        # XGBoost was trained on a malware-heavy dataset and tends to give
-        # inflated scores when ALL confirmed threat signals are zero (clean APKs,
-        # Hello World apps, internal tools).  If there is NO confirmed dynamic
-        # evidence we cap at 40 — the same ceiling the heuristic uses.
-        if _raw_data is not None:
-            static  = _raw_data.get("static",  {})
-            dynamic = _raw_data.get("dynamic", {})
-            ti      = _raw_data.get("threat_intel", {})
-            has_confirmed_signal = bool(
-                static.get("yara_matches")               # YARA hit
-                or dynamic.get("sms_intercepted")         # SMS/OTP stolen
-                or dynamic.get("accessibility_abuse")     # ATS / overlay
-                or dynamic.get("overlay_attack_detected") # UI overlay
-                or ti.get("malicious_count", 0) > 0       # known bad IOC
-                or len([r for r in dynamic.get("network_requests", [])
-                        if isinstance(r, dict) and r.get("suspicious")]) > 0  # C2
-            )
-            if not has_confirmed_signal:
-                risk_score = min(risk_score, 40.0)
-                logger.info(
-                    "XGBoost score capped at 40 (no confirmed signals): raw=%.1f → %.1f",
-                    float(proba[0] @ SEVERITY_VEC), risk_score
-                )
-
         return risk_score
 
     except Exception as exc:
@@ -196,22 +171,26 @@ def _heuristic_score(features: np.ndarray) -> float:
     normalized = np.clip(features / normalizers, 0, 1)
     raw = round(min(float(np.dot(normalized, weights)), 100.0), 1)
 
-    # If ZERO confirmed dynamic threats (no SMS, no accessibility abuse, no C2,
-    # no runtime downloads) AND no YARA matches AND no malicious IOCs
-    # AND no QuarkEngine crimes → cap at 40 (Low Risk / Suspicious at most).
-    # This prevents ad-SDK apps (Ludo, games, OEM tools) with many static
-    # permissions from being falsely flagged as Highly Malicious.
-    has_dynamic_signal = (
-        features[7] > 0   # sms_intercepted
+    # Static signals alone (permissions + suspicious APIs + obfuscation +
+    # dynamic code loading) CAN push above 40 — many real malware samples
+    # don't trigger dynamic sandbox signals (emulator detection, needs user
+    # interaction, etc.).  Only cap at 40 if the APK has ZERO suspicious
+    # static indicators too (truly clean apps like Hello World).
+    has_any_signal = (
+        features[0] > 3    # 4+ dangerous permissions
+        or features[1] > 2  # 3+ suspicious APIs
+        or features[2] > 0  # yara_match_count
+        or features[3] > 0  # obfuscation_detected
+        or features[4] > 0  # dynamic_code_loading
+        or features[6] > 0  # malicious_ioc_count
+        or features[7] > 0  # sms_intercepted
         or features[8] > 0  # accessibility_abuse
         or features[9] > 0  # c2_connection_count
-        or features[10] > 0  # runtime_downloads
-        or features[2] > 0   # yara_match_count
-        or features[6] > 0   # malicious_ioc_count
-        or features[12] > 0  # quark_crime_count
-        or features[13] > 0  # quark_max_confidence
+        or features[10] > 0 # runtime_downloads
+        or features[12] > 0 # quark_crime_count
+        or features[13] > 0 # quark_max_confidence
     )
-    if not has_dynamic_signal:
+    if not has_any_signal:
         raw = min(raw, 40.0)
 
     return raw
